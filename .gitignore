@@ -1,0 +1,65 @@
+.nfs*
+
+# compilation and distribution
+__pycache__
+_ext
+*.pyc
+*.pyd
+*.so
+*.dll
+*.egg-info/
+build/
+dist/
+wheels/
+
+# pytorch/python/numpy formats
+*.pth
+*.pkl
+*.npy
+*.ts
+model_ts*.txt
+
+# onnx models
+*.onnx
+
+# ipython/jupyter notebooks
+**/.ipynb_checkpoints/
+
+# Editor temporaries
+*.swn
+*.swo
+*.swp
+*~
+
+# editor settings
+.idea
+.vscode
+_darcs
+
+# demo 
+**/node_modules
+yarn.lock
+package-lock.json
+
+# 模型权重
+*.pth
+*.pt
+*.ckpt
+
+# 输入和输出数据
+images/
+sam_results*/
+sam_finetune_outputs/
+
+# Python临时文件
+__pycache__/
+*.pyc
+*.pyo
+
+# 编辑器和系统文件
+.vscode/
+.idea/
+.DS_Store
+
+# 日志
+*.log
