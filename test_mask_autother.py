@@ -25,7 +25,7 @@ class Logger(object):
 
 INPUT_FOLDER = "/home/zhao_ziyi/program/segment-anything-main/images"
 
-OUTPUT_FOLDER = "/home/zhao_ziyi/program/segment-anything-main/sam_results10_new"
+OUTPUT_FOLDER = "/home/zhao_ziyi/program/segment-anything-main/sam_results10_speed"
 
 #保存打印内容
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
@@ -40,7 +40,8 @@ subfolders = [
     'mask',
     'single_cells',
     'sam_masks',
-    'filtered_masks'
+    'filtered_masks',
+    'debug'
 ]
 
 # ====================== 2. 单细胞参数 ======================
@@ -48,10 +49,11 @@ subfolders = [
 OUTPUT_SIZE = 256       # 最终输出尺寸
 MARGIN_RATIO = 0.25     # 细胞周围留25%边距
 
-DOWNSAMPLE = 1  # 下采样比例，越小速度越快，但可能漏检小细胞
+DOWNSAMPLE = 1  # 下采样比例，越小速度越快，但可能漏检小细胞；1/4 比 1/8 更保细胞
 
 MIN_AREA = int(3500 * DOWNSAMPLE * DOWNSAMPLE)          # 过滤小碎片
 MAX_AREA = int(30000 * DOWNSAMPLE * DOWNSAMPLE)   # 过滤太大的
+MAX_AREA_RATIO = 0.5  # 超过整张图该比例的mask不参与颜色阈值计算，也会被过滤
 
 SKIP_BORDER_OBJECT = True  # 是否过滤贴边目标
 
@@ -70,10 +72,10 @@ FILTER=True # 是否使用过滤条件
 
 print("正在加载 SAM 模型...")
 
-BASE_CHECKPOINT = "/home/zhao_ziyi/program/segment-anything-main/sam_vit_h_4b8939.pth"
+BASE_CHECKPOINT = "/home/zhao_ziyi/program/segment-anything-main/sam_vit_b_01ec64.pth"
 FINETUNE_CHECKPOINT = "/home/zhao_ziyi/program/segment-anything-main/sam_finetune_outputs/last_decoder_finetune.pth"
 
-sam = sam_model_registry["vit_h"](
+sam = sam_model_registry["vit_b"](
     checkpoint=BASE_CHECKPOINT
 )
 
@@ -108,7 +110,12 @@ sam.to(device)
 
 mask_generator = SamAutomaticMaskGenerator(
     sam,
-    min_mask_region_area=MIN_AREA# 小于MIN_AREA像素的区域自动过滤
+    points_per_side=48,
+    pred_iou_thresh=0.78,
+    stability_score_thresh=0.85,
+    crop_n_layers=0,
+    min_mask_region_area=10,
+    points_per_batch=128
 )
 
 print("模型加载完成！")
@@ -123,7 +130,8 @@ subfolders = [
     'mask',
     'single_cells',
     'sam_masks',
-    'filtered_masks'
+    'filtered_masks',
+    'debug'
 ]
 
 for sf in subfolders:
@@ -297,6 +305,12 @@ def is_valid_mask(mask_dict, image,global_otsu, return_reason=False):
 
     if area < MIN_AREA:
         return finish(False, f"area {area} < MIN_AREA {MIN_AREA}")
+
+    max_area_by_ratio = int(H * W * MAX_AREA_RATIO)
+    info['max_area_by_ratio'] = max_area_by_ratio
+
+    if area > max_area_by_ratio:
+        return finish(False, f"area {area} > image_area*MAX_AREA_RATIO {max_area_by_ratio}")
 
     #if area > MAX_AREA:
         #return finish(False, f"area {area} > MAX_AREA {MAX_AREA}")
@@ -724,6 +738,7 @@ def process_single_image(img_path, save_name):
         f"DOWNSAMPLE={DOWNSAMPLE}",
         f"MIN_AREA={MIN_AREA}",
         f"MAX_AREA={MAX_AREA}",
+        f"MAX_AREA_RATIO={MAX_AREA_RATIO}",
         f"SKIP_BORDER_OBJECT={SKIP_BORDER_OBJECT}",
         f"FILTER_BY_COLOR={FILTER_BY_COLOR}",
         f"NUCLEUS_GRAY_SCALE={NUCLEUS_GRAY_SCALE}",
@@ -742,6 +757,9 @@ def process_single_image(img_path, save_name):
         f"{save_name}.npz"
     )
 
+    sam_inference_time = None
+    mask_source = "cache" if os.path.exists(mask_file) else "sam_generate"
+
     if os.path.exists(mask_file):
 
         print(
@@ -757,6 +775,8 @@ def process_single_image(img_path, save_name):
         masks = list(
         data["masks"]
         )
+        process_log.append(f"mask_source={mask_source}")
+        process_log.append("sam_inference_time=cache_reused")
 
     else:
 
@@ -765,9 +785,18 @@ def process_single_image(img_path, save_name):
             "SAM生成mask"
         )
 
+        sam_tic = time.time()
         masks = mask_generator.generate(
             image_rgb
         )
+        sam_inference_time = time.time() - sam_tic
+
+        print(
+            f"{save_name}: "
+            f"SAM only inference time={sam_inference_time:.2f}s"
+        )
+        process_log.append(f"mask_source={mask_source}")
+        process_log.append(f"sam_inference_time={sam_inference_time:.4f}s")
 
         np.savez_compressed(
             mask_file,
@@ -779,10 +808,18 @@ def process_single_image(img_path, save_name):
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # 只使用所有SAM mask覆盖到的区域计算Otsu阈值，避免大面积背景影响颜色筛选。
+    # 先排除接近整图的巨大mask，再计算Otsu阈值，避免颜色阈值被异常大mask带偏。
+    max_area_for_otsu = int(H * W * MAX_AREA_RATIO)
+    masks_for_otsu = [
+        mask_dict
+        for mask_dict in masks
+        if mask_dict['area'] <= max_area_for_otsu
+    ]
+    removed_large_for_otsu = len(masks) - len(masks_for_otsu)
+
     all_mask = np.zeros(gray.shape, dtype=bool)
 
-    for mask_dict in masks:
+    for mask_dict in masks_for_otsu:
         all_mask |= mask_dict['segmentation'].astype(bool)
 
     mask_pixel_count = int(all_mask.sum())
@@ -802,7 +839,9 @@ def process_single_image(img_path, save_name):
         process_log.append(
             f"Otsu detail: mask_pixel_count={mask_pixel_count}, "
             f"total_pixel_count={total_pixel_count}, mask_coverage={mask_coverage:.4f}, "
-            f"reason=exclude non-mask background pixels from threshold calculation"
+            f"removed_large_for_otsu={removed_large_for_otsu}, "
+            f"max_area_for_otsu={max_area_for_otsu}, "
+            f"reason=exclude non-mask background pixels and oversized masks from threshold calculation"
         )
     else:
         global_otsu = cv2.threshold(
@@ -814,7 +853,10 @@ def process_single_image(img_path, save_name):
         print("Global Otsu fallback:", global_otsu)
         process_log.append(f"Global Otsu fallback={global_otsu}")
         process_log.append(
-            f"Otsu detail: mask_pixel_count=0, reason=no mask pixels available"
+            f"Otsu detail: mask_pixel_count=0, "
+            f"removed_large_for_otsu={removed_large_for_otsu}, "
+            f"max_area_for_otsu={max_area_for_otsu}, "
+            f"reason=no mask pixels available after oversized-mask prefilter"
         )
 
     raw_masks = masks.copy()
@@ -895,6 +937,11 @@ def process_single_image(img_path, save_name):
     )
 
     process_log.append("\n========== Final result ==========")
+    process_log.append(f"mask_source={mask_source}")
+    if sam_inference_time is None:
+        process_log.append("sam_inference_time=cache_reused")
+    else:
+        process_log.append(f"sam_inference_time={sam_inference_time:.4f}s")
     process_log.append(f"raw_masks={len(masks)}")
     process_log.append(f"final_valid_masks={len(valid_masks)}")
 
